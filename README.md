@@ -4,4 +4,4 @@ Toy calculator for playing with retirement numbers.
 Entirely vibe coded, on mobile no less. 
 Shouldn't be relied upon to calculate retirement for your dog, let alone yourself. 
 
-No warranty, feedback welcome. 
+No warranty, feedback welcome (but may never be acted on, sorry) 
