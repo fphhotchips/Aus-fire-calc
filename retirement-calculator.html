@@ -1,0 +1,629 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Retirement Drawdown Calculator</title>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://unpkg.com/prop-types@15/prop-types.min.js"></script>
+<script src="https://unpkg.com/recharts@2.12.7/umd/Recharts.js"></script>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/tailwindcss/2.2.19/tailwind.min.css" />
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { background: #0f1117; color: #e2e8f0; font-family: 'Inter', system-ui, sans-serif; }
+  input[type=range] { -webkit-appearance: none; appearance: none; height: 4px; border-radius: 2px; background: #1e293b; outline: none; }
+  input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; width: 14px; height: 14px; border-radius: 50%; background: #2dd4bf; cursor: pointer; }
+  input[type=range]::-moz-range-thumb { width: 14px; height: 14px; border-radius: 50%; background: #2dd4bf; cursor: pointer; border: none; }
+  ::-webkit-scrollbar { width: 6px; height: 6px; } ::-webkit-scrollbar-track { background: #0f1117; } ::-webkit-scrollbar-thumb { background: #1e293b; border-radius: 3px; }
+  table th, table td { white-space: nowrap; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="react">
+
+const { useState, useMemo, useEffect, useCallback } = React;
+const { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer, ReferenceLine } = Recharts;
+
+// ── localStorage persistence ──────────────────────────────────────────────────
+const LS_KEY = "retirementCalc_v1";
+
+function loadState() {
+  try {
+    const raw = localStorage.getItem(LS_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch { return null; }
+}
+
+function saveState(state) {
+  try { localStorage.setItem(LS_KEY, JSON.stringify(state)); } catch {}
+}
+
+// ── Constants & helpers ───────────────────────────────────────────────────────
+const fmt  = (n) => new Intl.NumberFormat("en-AU", { style: "currency", currency: "AUD", maximumFractionDigits: 0 }).format(n);
+const pct  = (n, d = 1) => (n * 100).toFixed(d) + "%";
+const CARD = { background: "rgba(30,41,59,0.6)", border: "1px solid #334155", borderRadius: 12, padding: 20 };
+
+const BRACKETS = [
+  { from: 0,      to: 18200,    rate: 0.00 },
+  { from: 18200,  to: 45000,    rate: 0.16 },
+  { from: 45000,  to: 135000,   rate: 0.30 },
+  { from: 135000, to: 190000,   rate: 0.37 },
+  { from: 190000, to: Infinity, rate: 0.45 },
+];
+const MEDICARE = 0.02;
+const SUPER_ACCESS_AGE = 65;
+
+// ── Tax engine ────────────────────────────────────────────────────────────────
+function taxOnCapGain(otherIncome, gain, brackets = BRACKETS) {
+  if (gain <= 0) return 0;
+  const CGT_FLOOR = 0.30;
+  let tax = 0, remaining = gain, cursor = otherIncome;
+  for (const b of brackets) {
+    if (remaining <= 0) break;
+    if (cursor >= b.to) continue;
+    const start = Math.max(cursor, b.from);
+    const slice = Math.min(remaining, b.to - start);
+    tax += slice * Math.max(b.rate, CGT_FLOOR);
+    remaining -= slice;
+    cursor = start + slice;
+  }
+  if (otherIncome + gain > 26000) tax += gain * MEDICARE;
+  return tax;
+}
+
+function getEffectiveBrackets(inflation, year, rebalanceDecadally) {
+  if (!rebalanceDecadally || inflation === 0) return BRACKETS;
+  const decades = Math.floor(year / 10);
+  if (decades === 0) return BRACKETS;
+  const scaleFactor = Math.pow(1 + inflation / 100, decades * 10);
+  return BRACKETS.map(b => ({
+    from: b.from === 0 ? 0 : Math.round(b.from * scaleFactor),
+    to:   b.to === Infinity ? Infinity : Math.round(b.to * scaleFactor),
+    rate: b.rate,
+  }));
+}
+
+// ── Simulation ────────────────────────────────────────────────────────────────
+function simulate({ portfolioValue, costBasis, superBalance, currentAge, desiredIncome, otherIncome, nominalReturn, inflation, years, rebalanceBrackets = false }) {
+  const rows = [];
+  let portfolio = portfolioValue, nominalBasis = costBasis, superBal = superBalance;
+
+  for (let y = 0; y <= years; y++) {
+    const age = currentAge + y;
+    const cpi = Math.pow(1 + inflation / 100, y);
+    const nominalOtherIncome     = otherIncome * cpi;
+    const nominalDesiredAfterTax = desiredIncome * cpi;
+    const effectiveBrackets      = getEffectiveBrackets(inflation, y, rebalanceBrackets);
+    const superPreGrowth         = superBal * (1 + nominalReturn / 100);
+    const indexedBasis           = Math.min(nominalBasis * cpi, portfolio);
+    const gainRatio              = Math.max(0, Math.min(1, (portfolio - indexedBasis) / portfolio));
+
+    let portfolioWithdrawal = 0, taxPaid = 0, grossGain = 0;
+    if (portfolio > 0) {
+      let lo = 0, hi = Math.min(portfolio, nominalDesiredAfterTax * 4);
+      for (let i = 0; i < 80; i++) {
+        const mid = (lo + hi) / 2;
+        const tax = taxOnCapGain(nominalOtherIncome, mid * gainRatio, effectiveBrackets);
+        if (mid - tax < nominalDesiredAfterTax) lo = mid; else hi = mid;
+      }
+      portfolioWithdrawal = Math.min((lo + hi) / 2, portfolio);
+      grossGain = portfolioWithdrawal * gainRatio;
+      taxPaid   = Math.max(0, taxOnCapGain(nominalOtherIncome, grossGain, effectiveBrackets));
+    }
+
+    const portfolioAfterTax  = portfolioWithdrawal - taxPaid;
+    const shortfall          = Math.max(0, nominalDesiredAfterTax - portfolioAfterTax);
+    const superAccessible    = age >= SUPER_ACCESS_AGE;
+    const superWithdrawal    = superAccessible ? Math.min(shortfall, superPreGrowth) : 0;
+    const remainingShortfall = shortfall - superWithdrawal;
+    const totalWithdrawn     = portfolioWithdrawal + superWithdrawal;
+    const grossUpFactor      = nominalDesiredAfterTax > 0 ? totalWithdrawn / nominalDesiredAfterTax : 1;
+
+    rows.push({
+      year: y, age,
+      portfolioValue:      Math.round(portfolio),
+      superValue:          Math.round(superPreGrowth),
+      gainRatio:           gainRatio * 100,
+      effectiveRate:       portfolioWithdrawal > 0 ? (taxPaid / portfolioWithdrawal) * 100 : 0,
+      marginalOnGain:      grossGain > 0 ? (taxPaid / grossGain) * 100 : 0,
+      portfolioWithdrawal: Math.round(portfolioWithdrawal),
+      superWithdrawal:     Math.round(superWithdrawal),
+      grossWithdrawal:     Math.round(totalWithdrawn),
+      taxPaid:             Math.round(taxPaid),
+      nominalIncome:       Math.round(nominalDesiredAfterTax),
+      shortfall:           Math.round(remainingShortfall),
+      grossUpFactor,
+      superAccessible,
+      yearsToSuper:        superAccessible ? 0 : SUPER_ACCESS_AGE - age,
+    });
+
+    if (y < years) {
+      if (portfolio > 0) {
+        const basisSold = portfolioWithdrawal > 0 ? nominalBasis * (portfolioWithdrawal / portfolio) : 0;
+        nominalBasis = Math.max(0, nominalBasis - basisSold);
+        portfolio    = Math.max(0, portfolio * (1 + nominalReturn / 100) - portfolioWithdrawal);
+      }
+      superBal = Math.max(0, superPreGrowth - superWithdrawal);
+    }
+  }
+  return rows;
+}
+
+function survives(startValue, { costBasisRatio, superBalance, currentAge, desiredIncome, otherIncome, nominalReturn, inflation, years, rebalanceBrackets }) {
+  const rows = simulate({ portfolioValue: startValue, costBasis: startValue * costBasisRatio, superBalance, currentAge, desiredIncome, otherIncome, nominalReturn, inflation, years, rebalanceBrackets });
+  const last = rows[rows.length - 1];
+  return last.shortfall === 0 && (last.portfolioValue > 0 || last.superValue > 0);
+}
+
+function findMinPortfolio(params) {
+  if (!survives(20000000, params)) return null;
+  let lo = 0, hi = 20000000;
+  for (let i = 0; i < 60; i++) { const mid = (lo + hi) / 2; if (survives(mid, params)) hi = mid; else lo = mid; }
+  return Math.ceil((lo + hi) / 2 / 1000) * 1000;
+}
+
+// ── UI helpers ────────────────────────────────────────────────────────────────
+function Slider({ label, value, onChange, min, max, step, format, note }) {
+  return (
+    <div>
+      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
+        <span style={{ fontSize: 11, color: "#64748b", textTransform: "uppercase", letterSpacing: "0.1em", fontWeight: 600 }}>{label}</span>
+        <span style={{ color: "#2dd4bf", fontFamily: "monospace", fontSize: 13, fontWeight: 700 }}>{format(value)}</span>
+      </div>
+      {note && <p style={{ fontSize: 11, color: "#475569", marginBottom: 4 }}>{note}</p>}
+      <input type="range" min={min} max={max} step={step} value={value}
+        onChange={e => onChange(Number(e.target.value))}
+        style={{ width: "100%", cursor: "pointer" }} />
+      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, color: "#334155", marginTop: 2 }}>
+        <span>{format(min)}</span><span>{format(max)}</span>
+      </div>
+    </div>
+  );
+}
+
+function StatBox({ label, value, sub, accent, highlight, warn }) {
+  const borderColor = highlight ? "#2dd4bf" : warn ? "#f87171" : "#334155";
+  const bg          = highlight ? "#0d2e2a"  : warn ? "#2a0d0d"  : "rgba(30,41,59,0.6)";
+  const color       = accent || highlight ? "#2dd4bf" : warn ? "#f87171" : "#f1f5f9";
+  return (
+    <div style={{ ...CARD, borderColor, background: bg }}>
+      <p style={{ fontSize: 10, color: "#64748b", textTransform: "uppercase", letterSpacing: "0.1em", fontWeight: 600, marginBottom: 6 }}>{label}</p>
+      <p style={{ fontSize: "1.1rem", fontWeight: 800, color, lineHeight: 1.2 }}>{value}</p>
+      {sub && <p style={{ fontSize: 11, color: "#64748b", marginTop: 4 }}>{sub}</p>}
+    </div>
+  );
+}
+
+const CustomTooltip = ({ active, payload, label, data }) => {
+  if (!active || !payload?.length) return null;
+  const row = data?.find(d => d.year === label);
+  return (
+    <div style={{ background: "#0f1117", border: "1px solid #1e293b", borderRadius: 8, padding: "10px 14px", fontSize: 11, minWidth: 220 }}>
+      <p style={{ color: "#64748b", marginBottom: 2, fontWeight: 600 }}>Year {label}</p>
+      {row && <p style={{ color: "#475569", marginBottom: 6, fontSize: 10 }}>Age {row.age}{row.superAccessible ? " · Super accessible" : ` · Super in ${row.yearsToSuper} yr${row.yearsToSuper !== 1 ? "s" : ""}`}</p>}
+      {payload.map(p => (
+        <div key={p.name} style={{ display: "flex", justifyContent: "space-between", gap: 16, marginBottom: 3 }}>
+          <span style={{ color: p.color }}>{p.name}</span>
+          <span style={{ color: "#e2e8f0", fontFamily: "monospace" }}>
+            {p.name.includes("%") || p.name.includes("ratio") || p.name.includes("Rate") ? p.value.toFixed(1) + "%" : fmt(p.value)}
+          </span>
+        </div>
+      ))}
+    </div>
+  );
+};
+
+// ── Defaults ──────────────────────────────────────────────────────────────────
+const DEFAULTS = {
+  mode: "manual",
+  portfolioValue: 1500000,
+  costBasis: 600000,
+  gainRatioPct: 40,
+  desiredIncome: 80000,
+  otherIncome: 0,
+  nominalReturn: 7,
+  inflation: 2.5,
+  years: 30,
+  rebalanceBrackets: false,
+  yearsUntilRetirement: 0,
+  superBalance: 400000,
+  currentAge: 55,
+  activeTab: "withdrawals",
+};
+
+// ── App ───────────────────────────────────────────────────────────────────────
+function App() {
+  const saved = loadState() || {};
+  const S = (key) => saved[key] !== undefined ? saved[key] : DEFAULTS[key];
+
+  const [mode,                  setMode]                  = useState(S("mode"));
+  const [portfolioValue,        setPortfolioValue]        = useState(S("portfolioValue"));
+  const [costBasis,             setCostBasis]             = useState(S("costBasis"));
+  const [gainRatioPct,          setGainRatioPct]          = useState(S("gainRatioPct"));
+  const [desiredIncome,         setDesiredIncome]         = useState(S("desiredIncome"));
+  const [otherIncome,           setOtherIncome]           = useState(S("otherIncome"));
+  const [nominalReturn,         setNominalReturn]         = useState(S("nominalReturn"));
+  const [inflation,             setInflation]             = useState(S("inflation"));
+  const [years,                 setYears]                 = useState(S("years"));
+  const [rebalanceBrackets,     setRebalanceBrackets]     = useState(S("rebalanceBrackets"));
+  const [yearsUntilRetirement,  setYearsUntilRetirement]  = useState(S("yearsUntilRetirement"));
+  const [superBalance,          setSuperBalance]          = useState(S("superBalance"));
+  const [currentAge,            setCurrentAge]            = useState(S("currentAge"));
+  const [activeTab,             setActiveTab]             = useState(S("activeTab"));
+
+  // Save to localStorage whenever any value changes
+  useEffect(() => {
+    saveState({ mode, portfolioValue, costBasis, gainRatioPct, desiredIncome, otherIncome, nominalReturn, inflation, years, rebalanceBrackets, yearsUntilRetirement, superBalance, currentAge, activeTab });
+  }, [mode, portfolioValue, costBasis, gainRatioPct, desiredIncome, otherIncome, nominalReturn, inflation, years, rebalanceBrackets, yearsUntilRetirement, superBalance, currentAge, activeTab]);
+
+  const costBasisRatio  = 1 - gainRatioPct / 100;
+  const superAccessYear = Math.max(0, SUPER_ACCESS_AGE - currentAge);
+
+  const minPortfolio = useMemo(() => {
+    if (mode !== "solver") return null;
+    return findMinPortfolio({ costBasisRatio, superBalance, currentAge, desiredIncome, otherIncome, nominalReturn, inflation, years, rebalanceBrackets });
+  }, [mode, costBasisRatio, superBalance, currentAge, desiredIncome, otherIncome, nominalReturn, inflation, years, rebalanceBrackets]);
+
+  const displayPortfolio = mode === "solver" ? (minPortfolio ?? 1000000) : portfolioValue;
+  const displayBasis     = mode === "solver" ? (minPortfolio ?? 1000000) * costBasisRatio : costBasis;
+
+  const data = useMemo(() => simulate({
+    portfolioValue: displayPortfolio, costBasis: displayBasis,
+    superBalance, currentAge, desiredIncome, otherIncome, nominalReturn, inflation, years, rebalanceBrackets,
+  }), [displayPortfolio, displayBasis, superBalance, currentAge, desiredIncome, otherIncome, nominalReturn, inflation, years, rebalanceBrackets]);
+
+  const first    = data[0];
+  const last     = data[data.length - 1];
+  const peakGU   = Math.max(...data.map(d => d.grossUpFactor));
+  const realReturn = (((1 + nominalReturn / 100) / (1 + inflation / 100)) - 1) * 100;
+  const anyShortfall = data.some(d => d.shortfall > 0);
+  const firstShortfall = data.find(d => d.shortfall > 0);
+  const portfolioExhaustedYear = data.find(d => d.portfolioValue === 0 && d.year > 0)?.year;
+
+  const futureCPI       = Math.pow(1 + inflation / 100, yearsUntilRetirement);
+  const futurePortfolio = displayPortfolio * futureCPI;
+  const futureCostBasis = displayBasis * futureCPI;
+  const futureSuper     = superBalance * futureCPI;
+  const futureIncome    = desiredIncome * futureCPI;
+
+  const TAB = (id, label) => (
+    <button onClick={() => setActiveTab(id)} style={{
+      padding: "6px 14px", borderRadius: 6, fontSize: 12, fontWeight: 600, border: "none", cursor: "pointer",
+      background: activeTab === id ? "#0f766e" : "transparent",
+      color: activeTab === id ? "#ccfbf1" : "#64748b", transition: "all 0.15s",
+    }}>{label}</button>
+  );
+
+  const MODE_BTN = (id, label, desc) => (
+    <button onClick={() => setMode(id)} style={{
+      flex: 1, padding: "12px 16px", borderRadius: 8, cursor: "pointer", textAlign: "left",
+      border: mode === id ? "1.5px solid #2dd4bf" : "1.5px solid #1e293b",
+      background: mode === id ? "#0d2e2a" : "#0f1117", transition: "all 0.15s",
+    }}>
+      <p style={{ fontSize: 13, fontWeight: 700, color: mode === id ? "#2dd4bf" : "#94a3b8", margin: 0 }}>{label}</p>
+      <p style={{ fontSize: 11, color: "#475569", margin: "3px 0 0" }}>{desc}</p>
+    </button>
+  );
+
+  return (
+    <div style={{ background: "#0f1117", minHeight: "100vh", padding: "2rem 1rem" }}>
+      <div style={{ maxWidth: 980, margin: "0 auto" }}>
+
+        {/* Header */}
+        <div style={{ marginBottom: "1.75rem" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 8 }}>
+            <div>
+              <p style={{ fontSize: 11, color: "#2dd4bf", textTransform: "uppercase", letterSpacing: "0.12em", fontWeight: 600, marginBottom: 4 }}>Tax-Aware Decumulation · Australia</p>
+              <h1 style={{ fontSize: "1.9rem", fontWeight: 800, color: "#f1f5f9", marginBottom: 8 }}>Retirement Drawdown Calculator</h1>
+            </div>
+            <button onClick={() => { localStorage.removeItem(LS_KEY); window.location.reload(); }}
+              style={{ fontSize: 11, color: "#475569", background: "#1e293b", border: "1px solid #334155", borderRadius: 6, padding: "6px 12px", cursor: "pointer" }}>
+              Reset to defaults
+            </button>
+          </div>
+          <p style={{ fontSize: 13, color: "#64748b", maxWidth: 620 }}>
+            Models gross withdrawal requirements across an investment portfolio and superannuation.
+            Portfolio drawn first; super (tax-free) covers shortfalls from age 65.
+            <span style={{ color: "#2dd4bf", marginLeft: 8 }}>✓ Settings auto-saved</span>
+          </p>
+        </div>
+
+        {/* Bracket reference */}
+        <div style={{ ...CARD, marginBottom: "1.25rem" }}>
+          <p style={{ fontSize: 11, color: "#64748b", textTransform: "uppercase", letterSpacing: "0.1em", fontWeight: 600, marginBottom: 8 }}>2025–26 Tax Brackets — 30% CGT floor on gain portion · Thresholds fixed (not CPI-indexed)</p>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+            {[
+              { range: "$0–$18,200",        rate: "0% → 30% floor",    color: "#422006", amber: true },
+              { range: "$18,201–$45,000",   rate: "16% → 30% floor",   color: "#312e81", amber: true },
+              { range: "$45,001–$135,000",  rate: "30% + 2% Medicare", color: "#1e3a5f" },
+              { range: "$135,001–$190,000", rate: "37% + 2%",          color: "#3b1f63" },
+              { range: "$190,001+",         rate: "45% + 2%",          color: "#4c1d24" },
+              { range: "Super (pension)",   rate: "0% tax-free",       color: "#0d3d2a", teal: true },
+            ].map(b => (
+              <div key={b.range} style={{ background: b.color, borderRadius: 6, padding: "5px 10px", fontSize: 11,
+                border: b.amber ? "1px solid #78350f" : b.teal ? "1px solid #2dd4bf" : "1px solid transparent" }}>
+                <span style={{ color: "#94a3b8" }}>{b.range}</span>
+                <span style={{ color: b.amber ? "#fbbf24" : b.teal ? "#2dd4bf" : "#e2e8f0", fontWeight: 700, marginLeft: 6 }}>{b.rate}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* Mode selector */}
+        <div style={{ display: "flex", gap: 10, marginBottom: "1.25rem" }}>
+          {MODE_BTN("manual", "Manual mode", "Set portfolio value and cost basis — see what happens")}
+          {MODE_BTN("solver", "Solver mode", "Set income goal and gain ratio — find minimum investment portfolio needed")}
+        </div>
+
+        {/* Investment inputs */}
+        <div style={{ ...CARD, marginBottom: "1rem" }}>
+          <p style={{ fontSize: 11, color: "#64748b", textTransform: "uppercase", letterSpacing: "0.1em", fontWeight: 600, marginBottom: 16 }}>
+            {mode === "solver" ? "Income Goal & Investment Portfolio" : "Investment Portfolio & Income"}
+          </p>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(210px, 1fr))", gap: "1.25rem" }}>
+            {mode === "manual" ? (<>
+              <Slider label="Portfolio value" value={portfolioValue} onChange={setPortfolioValue} min={0} max={5000000} step={50000} format={fmt} />
+              <Slider label="Cost basis" value={costBasis} onChange={v => setCostBasis(Math.min(v, portfolioValue))}
+                min={0} max={Math.max(portfolioValue, 50000)} step={25000} format={fmt} note="Original invested amount (CPI-indexed each year for CGT)" />
+            </>) : (<>
+              <Slider label="Embedded gain at retirement" value={gainRatioPct} onChange={setGainRatioPct}
+                min={0} max={95} step={5} format={v => v + "% gain"} note="% of investment portfolio that will be unrealised gain" />
+              <div style={{ ...CARD, background: "#0d1117", borderColor: "#1e293b", display: "flex", flexDirection: "column", justifyContent: "center" }}>
+                <p style={{ fontSize: 10, color: "#64748b", textTransform: "uppercase", letterSpacing: "0.1em", fontWeight: 600, marginBottom: 6 }}>Min. investment portfolio needed</p>
+                {minPortfolio === null
+                  ? <p style={{ color: "#f87171", fontWeight: 700, fontSize: "1.05rem" }}>Not achievable — try adjusting inputs</p>
+                  : <p style={{ color: "#2dd4bf", fontWeight: 800, fontSize: "1.35rem", fontFamily: "monospace" }}>{fmt(minPortfolio)}</p>
+                }
+                {minPortfolio != null && <p style={{ fontSize: 11, color: "#475569", marginTop: 4 }}>
+                  Basis: {fmt(minPortfolio * costBasisRatio)} · Gain: {fmt(minPortfolio * (gainRatioPct / 100))}
+                </p>}
+              </div>
+            </>)}
+            <Slider label="Desired real income" value={desiredIncome} onChange={setDesiredIncome} min={20000} max={300000} step={5000} format={fmt} note="After-tax, in today's dollars" />
+            <Slider label="Other income (e.g. Age Pension)" value={otherIncome} onChange={setOtherIncome} min={0} max={100000} step={2500} format={fmt} note="Sets CGT bracket floor; CPI-scaled" />
+            <Slider label="Nominal investment return" value={nominalReturn} onChange={setNominalReturn} min={2} max={14} step={0.5} format={v => v + "%"} />
+            <Slider label="Inflation rate" value={inflation} onChange={setInflation} min={0} max={7} step={0.25} format={v => v + "%"} />
+            <Slider label="Years to model" value={years} onChange={setYears} min={10} max={90} step={1} format={v => v + " yrs"} />
+          </div>
+          <div style={{ marginTop: "1rem", paddingTop: "1rem", borderTop: "1px solid #1e293b" }}>
+            <label style={{ display: "flex", alignItems: "flex-start", gap: 10, cursor: "pointer" }}>
+              <input type="checkbox" checked={rebalanceBrackets} onChange={e => setRebalanceBrackets(e.target.checked)}
+                style={{ marginTop: 2, width: 14, height: 14, cursor: "pointer", flexShrink: 0, accentColor: "#2dd4bf" }} />
+              <span>
+                <span style={{ fontSize: 13, color: rebalanceBrackets ? "#2dd4bf" : "#94a3b8", fontWeight: 600 }}>
+                  Rebalance tax brackets for inflation every 10 years
+                </span>
+                <span style={{ display: "block", fontSize: 11, color: "#475569", marginTop: 2 }}>
+                  Simulates bracket thresholds adjusted to CPI at each decade mark (years 10, 20, 30…). Reduces bracket creep.
+                </span>
+              </span>
+            </label>
+          </div>
+          <div style={{ marginTop: 12, fontSize: 11, color: "#475569", display: "flex", flexWrap: "wrap", gap: 16 }}>
+            <span>Real return: <b style={{ color: "#94a3b8" }}>{realReturn.toFixed(2)}%</b></span>
+            <span>Starting portfolio: <b style={{ color: "#94a3b8" }}>{fmt(displayPortfolio)}</b></span>
+            <span>Starting gain ratio: <b style={{ color: "#94a3b8" }}>{((displayPortfolio - displayBasis) / displayPortfolio * 100).toFixed(1)}%</b></span>
+            {mode === "solver" && minPortfolio && (
+              <span style={{ color: "#2dd4bf", fontWeight: 600 }}>
+                Safe withdrawal rate: {((desiredIncome / minPortfolio) * 100).toFixed(2)}%
+              </span>
+            )}
+          </div>
+        </div>
+
+        {/* Super inputs */}
+        <div style={{ ...CARD, marginBottom: "1.25rem", borderColor: "#134e3a" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 16 }}>
+            <div style={{ width: 8, height: 8, borderRadius: "50%", background: "#2dd4bf" }} />
+            <span style={{ fontSize: 11, color: "#64748b", textTransform: "uppercase", letterSpacing: "0.1em", fontWeight: 600 }}>Superannuation</span>
+            <span style={{ fontSize: 11, color: "#475569" }}>· Tax-free from age {SUPER_ACCESS_AGE} · Grows at same nominal return · Covers shortfalls only</span>
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(210px, 1fr))", gap: "1.25rem" }}>
+            <Slider label="Super balance at retirement" value={superBalance} onChange={setSuperBalance}
+              min={0} max={3000000} step={25000} format={fmt} note="Amount held in super on the day you retire" />
+            <Slider label="Your age at retirement" value={currentAge} onChange={setCurrentAge}
+              min={18} max={70} step={1} format={v => v + " yrs"}
+              note={currentAge >= SUPER_ACCESS_AGE ? "Super is immediately accessible"
+                : `Super accessible in year ${superAccessYear} (age ${SUPER_ACCESS_AGE})`} />
+            <div style={{ ...CARD, background: "#0d1117", borderColor: "#134e3a" }}>
+              <p style={{ fontSize: 10, color: "#64748b", textTransform: "uppercase", letterSpacing: "0.1em", fontWeight: 600, marginBottom: 6 }}>Super at age {SUPER_ACCESS_AGE}</p>
+              {superAccessYear === 0
+                ? <p style={{ color: "#2dd4bf", fontSize: 13 }}>Accessible now</p>
+                : (() => {
+                    const superAtAccess = superBalance * Math.pow(1 + nominalReturn / 100, superAccessYear);
+                    return <>
+                      <p style={{ color: "#2dd4bf", fontWeight: 800, fontSize: "1.2rem", fontFamily: "monospace" }}>{fmt(superAtAccess)}</p>
+                      <p style={{ fontSize: 11, color: "#475569", marginTop: 4 }}>After {superAccessYear} yr{superAccessYear !== 1 ? "s" : ""} at {nominalReturn}%</p>
+                    </>;
+                  })()
+              }
+            </div>
+          </div>
+        </div>
+
+        {/* Key stats */}
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))", gap: "1rem", marginBottom: "1.25rem" }}>
+          {mode === "solver" && minPortfolio != null && (
+            <StatBox label="Min. investment portfolio" value={fmt(minPortfolio)} sub={`${fmt(desiredIncome)}/yr real · ${years} yrs`} highlight />
+          )}
+          <StatBox label="Year 1 withdrawal" value={fmt(first.grossWithdrawal)}
+            sub={`Portfolio: ${fmt(first.portfolioWithdrawal)} · Super: ${fmt(first.superWithdrawal)} · Tax: ${fmt(first.taxPaid)}`} />
+          <StatBox label={`Year ${years} withdrawal`} value={fmt(last.grossWithdrawal)}
+            sub={`Portfolio: ${fmt(last.portfolioWithdrawal)} · Super: ${fmt(last.superWithdrawal)} · Tax: ${fmt(last.taxPaid)}`} />
+          <StatBox label="Peak gross-up factor" value={`×${peakGU.toFixed(3)}`} sub="Max multiplier on spending" accent />
+          {portfolioExhaustedYear && (
+            <StatBox label="Portfolio exhausted" value={`Year ${portfolioExhaustedYear}`}
+              sub={`Age ${currentAge + portfolioExhaustedYear} — super covers from here`} />
+          )}
+          {anyShortfall
+            ? <StatBox label="Income shortfall" value={`Year ${firstShortfall.year}`}
+                sub={`Age ${firstShortfall.age} · ${fmt(firstShortfall.shortfall)} uncovered`} warn />
+            : <StatBox label="Income fully covered" value="All years ✓" sub="Portfolio + super meets income goal" accent />
+          }
+        </div>
+
+        {/* Charts */}
+        <div style={{ background: "#161b27", borderRadius: 8, border: "1px solid #1e293b", marginBottom: "1.25rem" }}>
+          <div style={{ padding: "12px 20px 0", display: "flex", gap: 6, flexWrap: "wrap" }}>
+            {TAB("withdrawals", "Withdrawals & Tax")}
+            {TAB("assets", "Asset Values")}
+            {TAB("rates", "Tax Rates")}
+          </div>
+          <div style={{ padding: "16px 8px 8px" }}>
+            {activeTab === "withdrawals" && (
+              <ResponsiveContainer width="100%" height={300}>
+                <LineChart data={data} margin={{ top: 4, right: 16, left: 0, bottom: 4 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" />
+                  <XAxis dataKey="year" tick={{ fill: "#64748b", fontSize: 11 }} />
+                  <YAxis tick={{ fill: "#64748b", fontSize: 11 }} tickFormatter={v => "$" + (v / 1000).toFixed(0) + "k"} />
+                  <Tooltip content={<CustomTooltip data={data} />} />
+                  <Legend wrapperStyle={{ fontSize: 11, color: "#94a3b8", paddingTop: 8 }} />
+                  {superAccessYear > 0 && <ReferenceLine x={superAccessYear} stroke="#2dd4bf44" strokeDasharray="4 3" label={{ value: "Super accessible", fill: "#2dd4bf88", fontSize: 9, position: "insideTopLeft" }} />}
+                  {rebalanceBrackets && [10,20,30,40,50,60,70,80].filter(y => y <= years).map(y => (
+                    <ReferenceLine key={y} x={y} stroke="#fbbf2422" strokeDasharray="2 4" label={{ value: "Brackets↑", fill: "#fbbf2466", fontSize: 8, position: "insideTopRight" }} />
+                  ))}
+                  <Line type="monotone" dataKey="nominalIncome"       name="After-tax income needed"     stroke="#475569" strokeDasharray="4 2" dot={false} strokeWidth={1.5} />
+                  <Line type="monotone" dataKey="portfolioWithdrawal" name="Drawn from portfolio (gross)" stroke="#2dd4bf" dot={false} strokeWidth={2} />
+                  <Line type="monotone" dataKey="superWithdrawal"     name="Drawn from super (tax-free)"  stroke="#a78bfa" dot={false} strokeWidth={2} />
+                  <Line type="monotone" dataKey="taxPaid"             name="Tax paid"                     stroke="#f87171" dot={false} strokeWidth={1.5} />
+                </LineChart>
+              </ResponsiveContainer>
+            )}
+            {activeTab === "assets" && (
+              <ResponsiveContainer width="100%" height={300}>
+                <LineChart data={data} margin={{ top: 4, right: 16, left: 0, bottom: 4 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" />
+                  <XAxis dataKey="year" tick={{ fill: "#64748b", fontSize: 11 }} />
+                  <YAxis tick={{ fill: "#64748b", fontSize: 11 }} tickFormatter={v => "$" + (v / 1000000).toFixed(2) + "M"} />
+                  <Tooltip content={<CustomTooltip data={data} />} />
+                  <Legend wrapperStyle={{ fontSize: 11, color: "#94a3b8", paddingTop: 8 }} />
+                  {superAccessYear > 0 && <ReferenceLine x={superAccessYear} stroke="#2dd4bf44" strokeDasharray="4 3" label={{ value: "Super accessible", fill: "#2dd4bf88", fontSize: 9, position: "insideTopLeft" }} />}
+                  <Line type="monotone" dataKey="portfolioValue" name="Investment portfolio" stroke="#2dd4bf" dot={false} strokeWidth={2.5} />
+                  <Line type="monotone" dataKey="superValue"     name="Superannuation"       stroke="#a78bfa" dot={false} strokeWidth={2.5} />
+                </LineChart>
+              </ResponsiveContainer>
+            )}
+            {activeTab === "rates" && (
+              <ResponsiveContainer width="100%" height={300}>
+                <LineChart data={data} margin={{ top: 4, right: 16, left: 0, bottom: 4 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" />
+                  <XAxis dataKey="year" tick={{ fill: "#64748b", fontSize: 11 }} />
+                  <YAxis tick={{ fill: "#64748b", fontSize: 11 }} tickFormatter={v => v + "%"} domain={[0, 55]} />
+                  <Tooltip content={<CustomTooltip data={data} />} />
+                  <Legend wrapperStyle={{ fontSize: 11, color: "#94a3b8", paddingTop: 8 }} />
+                  {[18, 32, 39, 47].map((r, i) => (
+                    <ReferenceLine key={i} y={r} stroke="#334155" strokeDasharray="2 4" label={{ value: ["18%","32%","39%","47%"][i], fill: "#475569", fontSize: 9, position: "insideTopRight" }} />
+                  ))}
+                  <Line type="monotone" dataKey="gainRatio"      name="Embedded gain ratio (%)"          stroke="#a78bfa" dot={false} strokeWidth={2} />
+                  <Line type="monotone" dataKey="marginalOnGain" name="Marginal rate on gain (%)"         stroke="#fb923c" dot={false} strokeWidth={2} />
+                  <Line type="monotone" dataKey="effectiveRate"  name="Eff. rate on portfolio withdrawal" stroke="#f87171" dot={false} strokeWidth={1.5} strokeDasharray="3 2" />
+                </LineChart>
+              </ResponsiveContainer>
+            )}
+          </div>
+        </div>
+
+        {/* Table */}
+        <div style={{ ...CARD, marginBottom: "1.25rem", overflowX: "auto" }}>
+          <p style={{ fontSize: 11, color: "#64748b", textTransform: "uppercase", letterSpacing: "0.1em", fontWeight: 600, marginBottom: 12 }}>Year-by-year breakdown</p>
+          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11 }}>
+            <thead>
+              <tr style={{ borderBottom: "1px solid #1e293b" }}>
+                {["Yr","Age","Portfolio","Super","Gain ratio","Portfolio draw","Super draw","Tax","Eff. rate"].map(h => (
+                  <th key={h} style={{ textAlign: "right", padding: "4px 8px", color: "#475569", fontWeight: 600 }}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {data.filter(d => d.year <= 5 || d.year % 5 === 0).map(d => (
+                <tr key={d.year} style={{ borderBottom: "1px solid rgba(30,41,59,0.5)",
+                  background: d.shortfall > 0 ? "rgba(42,13,13,0.4)" : d.superWithdrawal > 0 ? "rgba(13,46,42,0.2)" : "transparent" }}>
+                  <td style={{ padding: "4px 8px", color: "#64748b",  textAlign: "right" }}>{d.year}</td>
+                  <td style={{ padding: "4px 8px", textAlign: "right", color: d.superAccessible ? "#2dd4bf" : "#64748b", fontWeight: d.superAccessible ? 600 : 400 }}>{d.age}</td>
+                  <td style={{ padding: "4px 8px", color: "#e2e8f0",  textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{fmt(d.portfolioValue)}</td>
+                  <td style={{ padding: "4px 8px", color: "#a78bfa",  textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{fmt(d.superValue)}</td>
+                  <td style={{ padding: "4px 8px", color: "#a78bfa",  textAlign: "right" }}>{d.gainRatio.toFixed(1)}%</td>
+                  <td style={{ padding: "4px 8px", color: "#2dd4bf",  textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{fmt(d.portfolioWithdrawal)}</td>
+                  <td style={{ padding: "4px 8px", color: "#a78bfa",  textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{d.superWithdrawal > 0 ? fmt(d.superWithdrawal) : "—"}</td>
+                  <td style={{ padding: "4px 8px", color: "#f87171",  textAlign: "right", fontVariantNumeric: "tabular-nums" }}>{fmt(d.taxPaid)}</td>
+                  <td style={{ padding: "4px 8px", color: "#fb923c",  textAlign: "right" }}>{d.effectiveRate.toFixed(1)}%</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          <div style={{ display: "flex", gap: 16, marginTop: 8, fontSize: 10, color: "#334155" }}>
+            <span>Years 0–5 then every 5th year.</span>
+            <span style={{ color: "rgba(167,139,250,0.6)" }}>■ Super drawn</span>
+            <span style={{ color: "rgba(248,113,113,0.6)" }}>■ Shortfall</span>
+            <span style={{ color: "#2dd4bf" }}>Teal age = super accessible</span>
+          </div>
+        </div>
+
+        {/* Moving Target */}
+        <div style={{ ...CARD, marginBottom: "1.25rem", borderColor: "#1e3a5f" }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 14 }}>
+            <div style={{ width: 8, height: 8, borderRadius: "50%", background: "#60a5fa" }} />
+            <span style={{ fontSize: 11, color: "#64748b", textTransform: "uppercase", letterSpacing: "0.1em", fontWeight: 600 }}>Moving Target</span>
+            <span style={{ fontSize: 11, color: "#475569" }}>· All figures in today's dollars · Shows what numbers need to be at retirement</span>
+          </div>
+          <div style={{ marginBottom: 16 }}>
+            <Slider label="Years until retirement" value={yearsUntilRetirement} onChange={setYearsUntilRetirement}
+              min={0} max={50} step={1} format={v => v === 0 ? "Retiring now" : v + " yrs"}
+              note={yearsUntilRetirement === 0
+                ? "Set this to your years until retirement to see inflation-adjusted targets"
+                : `At ${inflation}% inflation for ${yearsUntilRetirement} yr${yearsUntilRetirement !== 1 ? "s" : ""} — CPI factor: ×${futureCPI.toFixed(3)}`} />
+          </div>
+          {yearsUntilRetirement > 0 && (
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(170px, 1fr))", gap: "0.75rem" }}>
+              {[
+                { label: mode === "solver" ? "Min. portfolio (future $)" : "Portfolio value (future $)", today: displayPortfolio, future: futurePortfolio },
+                { label: "Cost basis (future $)",           today: displayBasis,  future: futureCostBasis },
+                { label: "Super balance (future $)",        today: superBalance,  future: futureSuper },
+                { label: "Annual income target (future $)", today: desiredIncome, future: futureIncome },
+              ].map(item => (
+                <div key={item.label} style={{ background: "#0d1117", border: "1px solid #1e3a5f", borderRadius: 8, padding: "10px 14px" }}>
+                  <p style={{ fontSize: 10, color: "#475569", textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 6 }}>{item.label}</p>
+                  <p style={{ fontSize: "1.1rem", fontWeight: 800, color: "#60a5fa", fontFamily: "monospace", marginBottom: 4 }}>{fmt(item.future)}</p>
+                  <p style={{ fontSize: 10, color: "#334155" }}>Today: {fmt(item.today)}</p>
+                </div>
+              ))}
+              <div style={{ background: "#0d1117", border: "1px solid #1e3a5f", borderRadius: 8, padding: "10px 14px" }}>
+                <p style={{ fontSize: 10, color: "#475569", textTransform: "uppercase", letterSpacing: "0.08em", marginBottom: 6 }}>Purchasing power lost</p>
+                <p style={{ fontSize: "1.1rem", fontWeight: 800, color: "#f87171", fontFamily: "monospace", marginBottom: 4 }}>{((1 - 1 / futureCPI) * 100).toFixed(1)}%</p>
+                <p style={{ fontSize: 10, color: "#334155" }}>$1 today = {(100 / futureCPI).toFixed(1)}¢ at retirement</p>
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* Formula */}
+        <div style={{ ...CARD, marginBottom: "2rem" }}>
+          <p style={{ fontSize: 11, color: "#64748b", textTransform: "uppercase", letterSpacing: "0.1em", fontWeight: 600, marginBottom: 8 }}>How it's calculated</p>
+          <div style={{ background: "#0d1117", borderRadius: 8, padding: "12px 16px", fontFamily: "monospace", fontSize: 11, color: "#2dd4bf", marginBottom: 10, lineHeight: 1.8 }}>
+            <p style={{ color: "#475569" }}>// Each year:</p>
+            <p>1. Solve W from portfolio: W − taxOnCapGain(otherIncome, W × gainRatio) = target</p>
+            <p>2. shortfall = target − (W − tax)  [if portfolio insufficient]</p>
+            <p>3. If age ≥ {SUPER_ACCESS_AGE}: draw shortfall from super tax-free (1:1)</p>
+            <p style={{ color: "#475569", marginTop: 4 }}>// gainRatio = (portfolio − nominalBasis × CPI) / portfolio</p>
+            <p style={{ color: "#475569" }}>// CGT floor: gain dollars taxed at max(bracketRate, 30%) + 2% Medicare</p>
+            <p style={{ color: "#475569" }}>// Super grows at same nominal return, pension phase = 0% tax</p>
+          </div>
+          <p style={{ fontSize: 11, color: "#475569" }}>
+            Super modelled in pension phase at 0% tax on earnings and withdrawals from age {SUPER_ACCESS_AGE}.
+            Solver finds minimum <em>investment</em> portfolio, treating super as fixed additional capital.
+            All settings saved automatically to your browser's localStorage.
+          </p>
+        </div>
+
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
